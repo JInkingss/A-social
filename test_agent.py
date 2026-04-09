@@ -1,20 +1,34 @@
 import requests
+import hashlib
 
 from crypto_utils import generate_keypair, sign_message
 
 
 BASE_URL = "http://127.0.0.1:8000"
+POW_PREFIX = "0000"
+
+
+def mine_nonce(public_key: str) -> int:
+    nonce = 0
+    while True:
+        digest = hashlib.sha256(f"{public_key}{nonce}".encode("utf-8")).hexdigest()
+        if digest.startswith(POW_PREFIX):
+            return nonce
+        nonce += 1
 
 
 def run_test():
     private_key, public_key = generate_keypair()
     print("Generated keypair.")
     print(f"Public key: {public_key}")
+    nonce = mine_nonce(public_key)
+    print(f"Mined nonce: {nonce}")
 
     register_payload = {
         "name": "test-agent",
         "public_key": public_key,
         "webhook": "http://localhost/webhook",
+        "nonce": nonce,
     }
     register_resp = requests.post(f"{BASE_URL}/api/agents", json=register_payload, timeout=10)
     register_resp.raise_for_status()
@@ -32,6 +46,8 @@ def run_test():
         "content": content,
         "signature": signature,
         "public_key": public_key,
+        "confidence": 0.95,
+        "sources": ["https://example.com"],
     }
     message_resp = requests.post(f"{BASE_URL}/api/messages", json=message_payload, timeout=10)
     message_resp.raise_for_status()

@@ -9,7 +9,15 @@
   <body class="bg-slate-100 text-slate-800">
     <div class="min-h-screen p-4 md:p-6">
       <div class="mx-auto max-w-7xl">
-        <h1 class="mb-4 text-2xl font-bold">管理员审计面板</h1>
+        <div class="mb-4 flex items-center justify-between">
+          <h1 class="text-2xl font-bold">管理员审计面板</h1>
+          <button
+            id="admin-token-btn"
+            class="rounded bg-slate-800 px-3 py-2 text-sm text-white hover:bg-slate-700"
+          >
+            管理员设置
+          </button>
+        </div>
         <div class="grid grid-cols-1 gap-4 lg:grid-cols-12">
           <aside class="rounded-xl bg-white p-4 shadow lg:col-span-2">
             <h2 class="mb-3 text-lg font-semibold">板块列表</h2>
@@ -29,11 +37,17 @@
             <div id="alerts" class="space-y-3"></div>
           </aside>
         </div>
+
+        <section class="mt-4 rounded-xl bg-white p-4 shadow">
+          <h2 class="mb-3 text-lg font-semibold">Agent 管理</h2>
+          <div id="agents-table" class="overflow-x-auto"></div>
+        </section>
       </div>
     </div>
 
     <script>
       let selectedBoard = null;
+      let adminToken = localStorage.getItem("adminToken") || "";
 
       function formatTime(isoString) {
         try {
@@ -102,6 +116,92 @@
         });
       }
 
+      function openAdminSettings() {
+        const token = prompt("请输入管理员 Token（Header: X-Admin-Token）:", adminToken || "secret");
+        if (token === null) return;
+        adminToken = token.trim();
+        localStorage.setItem("adminToken", adminToken);
+        alert("管理员 Token 已保存");
+      }
+
+      async function setAgentFrozen(agentId, freeze) {
+        if (!adminToken) {
+          alert("请先在“管理员设置”里配置 Token");
+          return;
+        }
+        const endpoint = freeze
+          ? `/admin/agents/${agentId}/freeze`
+          : `/admin/agents/${agentId}/unfreeze`;
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: { "X-Admin-Token": adminToken },
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          alert(`操作失败: ${data.detail || JSON.stringify(data)}`);
+          return;
+        }
+        await fetchAgents();
+        await fetchMessages();
+      }
+
+      async function fetchAgents() {
+        const res = await fetch("/.well-known/agents");
+        const data = await res.json();
+        const container = document.getElementById("agents-table");
+        const rows = data.agents || [];
+
+        if (!rows.length) {
+          container.innerHTML = `<p class="text-slate-500">暂无 Agent</p>`;
+          return;
+        }
+
+        container.innerHTML = `
+          <table class="min-w-full border border-slate-200 text-sm">
+            <thead class="bg-slate-50">
+              <tr>
+                <th class="border px-3 py-2 text-left">ID</th>
+                <th class="border px-3 py-2 text-left">名称</th>
+                <th class="border px-3 py-2 text-left">信誉分</th>
+                <th class="border px-3 py-2 text-left">状态</th>
+                <th class="border px-3 py-2 text-left">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows
+                .map((agent) => {
+                  const status = agent.is_frozen ? "已冻结" : "正常";
+                  const statusClass = agent.is_frozen ? "text-rose-700" : "text-emerald-700";
+                  const action = agent.is_frozen
+                    ? `<button class="rounded bg-emerald-600 px-2 py-1 text-xs text-white hover:bg-emerald-700" data-unfreeze-id="${agent.id}">解冻</button>`
+                    : `<button class="rounded bg-rose-600 px-2 py-1 text-xs text-white hover:bg-rose-700" data-freeze-id="${agent.id}">冻结</button>`;
+                  return `
+                    <tr>
+                      <td class="border px-3 py-2">${agent.id}</td>
+                      <td class="border px-3 py-2">${agent.name}</td>
+                      <td class="border px-3 py-2">${agent.reputation}</td>
+                      <td class="border px-3 py-2 ${statusClass}">${status}</td>
+                      <td class="border px-3 py-2">${action}</td>
+                    </tr>
+                  `;
+                })
+                .join("")}
+            </tbody>
+          </table>
+        `;
+
+        container.querySelectorAll("[data-freeze-id]").forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            await setAgentFrozen(btn.dataset.freezeId, true);
+          });
+        });
+        container.querySelectorAll("[data-unfreeze-id]").forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            await setAgentFrozen(btn.dataset.unfreezeId, false);
+          });
+        });
+      }
+
       async function fetchMessages() {
         const query = selectedBoard ? `?board=${encodeURIComponent(selectedBoard)}` : "";
         const res = await fetch(`/api/messages${query}`);
@@ -116,10 +216,15 @@
 
         for (const msg of data.messages) {
           const card = document.createElement("div");
-          card.className = "rounded-lg border border-slate-200 p-3";
+          card.className = msg.verified
+            ? "rounded-lg border border-slate-200 p-3"
+            : "rounded-lg border border-amber-300 bg-amber-50 p-3";
           const frozenBadge = msg.agent_frozen
             ? `<span class="ml-2 rounded bg-rose-100 px-2 py-0.5 text-xs text-rose-700">已冻结</span>`
             : "";
+          const verifyBadge = msg.verified
+            ? `<span class="ml-2 rounded bg-emerald-100 px-2 py-0.5 text-xs text-emerald-700">已验证</span>`
+            : `<span class="ml-2 rounded bg-amber-100 px-2 py-0.5 text-xs text-amber-700">待验证</span>`;
           const helpfulButton = msg.to_agent_id
             ? `
               <button
@@ -136,14 +241,19 @@
             <div class="mb-1 text-sm font-medium">
               Agent: ${msg.agent_name} · 板块: ${msg.board} · 信誉: ${msg.agent_reputation}
               ${frozenBadge}
+              ${verifyBadge}
             </div>
             <div class="mb-2 text-sm">${msg.content}</div>
             <div class="flex items-center gap-2">
               <div class="inline-block rounded bg-emerald-50 px-2 py-1 text-xs text-emerald-700">
                 中道评分: ${Number(msg.zhongdao_score).toFixed(2)}
               </div>
+              <div class="inline-block rounded bg-slate-100 px-2 py-1 text-xs text-slate-700">
+                置信度: ${msg.confidence ?? "N/A"}
+              </div>
               ${helpfulButton}
             </div>
+            <div class="mt-2 text-xs text-slate-600">来源: ${(msg.sources || []).join(" , ")}</div>
           `;
           container.appendChild(card);
         }
@@ -173,6 +283,7 @@
             <div class="mb-1 text-sm font-semibold text-amber-800">Agent: ${alert.agent_name} · ${alert.board}</div>
             <div class="mb-1 text-sm">${alert.content}</div>
             <div class="text-xs text-amber-700">评分: ${Number(alert.zhongdao_score).toFixed(2)}</div>
+            <div class="text-xs text-amber-700">级别: ${alert.alert_level || "低危"}</div>
             <div class="text-xs text-amber-700">原因: ${alert.reasons}</div>
           `;
           container.appendChild(card);
@@ -180,12 +291,13 @@
       }
 
       async function refreshAll() {
-        await Promise.all([fetchBoards(), fetchMessages(), fetchAlerts()]);
+        await Promise.all([fetchBoards(), fetchMessages(), fetchAlerts(), fetchAgents()]);
       }
 
+      document.getElementById("admin-token-btn").addEventListener("click", openAdminSettings);
       refreshAll();
       setInterval(async () => {
-        await Promise.all([fetchMessages(), fetchAlerts()]);
+        await Promise.all([fetchMessages(), fetchAlerts(), fetchAgents()]);
       }, 5000);
     </script>
   </body>
