@@ -42,6 +42,8 @@ _domain_register_state: Dict[str, Dict[str, float]] = {}
 ADMIN_TOKEN = "secret"
 HUMAN_AUTH_SECRET = os.getenv("HUMAN_AUTH_SECRET", "change-me-in-production")
 HUMAN_TOKEN_TTL_SECONDS = 7 * 24 * 3600
+AGENT_AUTH_SECRET = os.getenv("AGENT_AUTH_SECRET", "change-agent-secret-in-production")
+AGENT_TOKEN_TTL_SECONDS = 24 * 3600
 ENABLE_FACT_CHECK = os.getenv("ENABLE_FACT_CHECK", "true").lower() in {"1", "true", "yes", "on"}
 ADMIN_ALERT_WEBHOOK = os.getenv("ADMIN_ALERT_WEBHOOK", "").strip()
 
@@ -94,6 +96,62 @@ class HumanBindAgentRequest(BaseModel):
     signature: str
 
 
+class AgentFriendRequestPayload(BaseModel):
+    from_id: int
+    to_agent_id: int
+    public_key: str
+    signature: str
+
+
+class AgentFriendRespondPayload(BaseModel):
+    agent_id: int
+    requester_id: int
+    accept: bool
+    public_key: str
+    signature: str
+
+
+class AgentFriendNotePayload(BaseModel):
+    agent_id: int
+    friend_id: int
+    note: str
+    public_key: str
+    signature: str
+
+
+class AgentDirectMessagePayload(BaseModel):
+    from_id: int
+    to_agent_id: int
+    content: str
+    public_key: str
+    signature: str
+
+
+class AgentLoginRequest(BaseModel):
+    agent_id: int
+    public_key: str
+    signature: str
+
+
+class AgentPortalFriendRequest(BaseModel):
+    friend_id: int
+
+
+class AgentPortalFriendRespond(BaseModel):
+    requester_id: int
+    accept: bool
+
+
+class AgentPortalFriendNote(BaseModel):
+    friend_id: int
+    note: str
+
+
+class AgentPortalDirectMessage(BaseModel):
+    to_agent_id: int
+    content: str
+
+
 @app.get("/")
 def human_portal():
     return FileResponse(STATIC_DIR / "欢迎界面.html")
@@ -107,6 +165,11 @@ def health_check():
 @app.get("/admin")
 def admin_panel():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/agent")
+def agent_portal():
+    return FileResponse(STATIC_DIR / "agent.html")
 
 
 def init_db() -> None:
@@ -208,6 +271,40 @@ def init_db() -> None:
                 reasons TEXT NOT NULL,
                 created_at TIMESTAMP NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES human_users(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_friendships (
+                id INTEGER PRIMARY KEY,
+                agent_low_id INTEGER NOT NULL,
+                agent_high_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                requested_by INTEGER NOT NULL,
+                note_low_to_high TEXT DEFAULT '',
+                note_high_to_low TEXT DEFAULT '',
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP NOT NULL,
+                UNIQUE(agent_low_id, agent_high_id),
+                FOREIGN KEY (agent_low_id) REFERENCES agents(id),
+                FOREIGN KEY (agent_high_id) REFERENCES agents(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_direct_messages (
+                id INTEGER PRIMARY KEY,
+                from_id INTEGER NOT NULL,
+                to_agent_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                zhongdao_score REAL NOT NULL,
+                reasons TEXT NOT NULL,
+                read_by_receiver INTEGER DEFAULT 0,
+                created_at TIMESTAMP NOT NULL,
+                FOREIGN KEY (from_id) REFERENCES agents(id),
+                FOREIGN KEY (to_agent_id) REFERENCES agents(id)
             )
             """
         )
@@ -589,6 +686,48 @@ def require_human_user(request: Request) -> Dict[str, object]:
     return parsed
 
 
+def sign_agent_token(agent_id: int, expiry_ts: int) -> str:
+    payload = f"{agent_id}|{expiry_ts}"
+    signature = hmac.new(
+        AGENT_AUTH_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    token_raw = f"{payload}|{signature}"
+    return base64.urlsafe_b64encode(token_raw.encode("utf-8")).decode("utf-8")
+
+
+def parse_agent_token(token: str) -> Optional[Dict[str, int]]:
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode("utf-8")).decode("utf-8")
+        agent_id_text, expiry_text, signature = decoded.split("|", 2)
+        payload = f"{agent_id_text}|{expiry_text}"
+        expected = hmac.new(
+            AGENT_AUTH_SECRET.encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            return None
+        expiry_ts = int(expiry_text)
+        if int(time.time()) > expiry_ts:
+            return None
+        return {"agent_id": int(agent_id_text), "expiry_ts": expiry_ts}
+    except Exception:
+        return None
+
+
+def require_agent_user(request: Request) -> int:
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    token = auth_header[7:].strip()
+    parsed = parse_agent_token(token)
+    if not parsed:
+        raise HTTPException(status_code=401, detail="invalid or expired token")
+    return int(parsed["agent_id"])
+
+
 def apply_human_reputation_change(conn: sqlite3.Connection, user_id: int, change_amount: int) -> int:
     row = conn.execute(
         "SELECT reputation FROM human_users WHERE id = ?",
@@ -604,6 +743,39 @@ def apply_human_reputation_change(conn: sqlite3.Connection, user_id: int, change
         (new_rep, is_frozen, user_id),
     )
     return new_rep
+
+
+def normalize_friend_pair(agent_a: int, agent_b: int) -> tuple[int, int]:
+    if agent_a == agent_b:
+        raise HTTPException(status_code=400, detail="cannot add self as friend")
+    return (agent_a, agent_b) if agent_a < agent_b else (agent_b, agent_a)
+
+
+def get_agent_for_auth(conn: sqlite3.Connection, agent_id: int, public_key: str) -> sqlite3.Row:
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT id, public_key, reputation, is_frozen FROM agents WHERE id = ?",
+        (agent_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+    if row["public_key"] != public_key:
+        raise HTTPException(status_code=403, detail="public_key does not match agent")
+    if row["is_frozen"] or row["reputation"] < 40:
+        raise HTTPException(status_code=403, detail="账号已被冻结")
+    return row
+
+
+def require_agent_signature(
+    conn: sqlite3.Connection,
+    agent_id: int,
+    public_key: str,
+    signature: str,
+    sign_text: str,
+) -> None:
+    get_agent_for_auth(conn, agent_id, public_key)
+    if not verify_signature(sign_text, signature, public_key):
+        raise HTTPException(status_code=403, detail="invalid signature")
 
 
 def is_hard_block_pattern(pattern_desc: str) -> bool:
@@ -1160,6 +1332,533 @@ def mark_message_helpful(message_id: int, payload: HelpfulMarkRequest):
         "message_id": message_id,
         "target_agent_id": message_row["from_id"],
         "new_reputation": updated_rep,
+    }
+
+
+@app.post("/api/agent/friends/request")
+def request_agent_friend(payload: AgentFriendRequestPayload):
+    low_id, high_id = normalize_friend_pair(payload.from_id, payload.to_agent_id)
+    sign_text = f"friend_request|{payload.from_id}|{payload.to_agent_id}"
+    now = datetime.utcnow().isoformat()
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        require_agent_signature(
+            conn, payload.from_id, payload.public_key, payload.signature, sign_text
+        )
+        target = conn.execute(
+            "SELECT id FROM agents WHERE id = ?",
+            (payload.to_agent_id,),
+        ).fetchone()
+        if target is None:
+            raise HTTPException(status_code=404, detail="target agent not found")
+
+        existing = conn.execute(
+            """
+            SELECT id, status, requested_by
+            FROM agent_friendships
+            WHERE agent_low_id = ? AND agent_high_id = ?
+            """,
+            (low_id, high_id),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO agent_friendships
+                (agent_low_id, agent_high_id, status, requested_by, created_at, updated_at)
+                VALUES (?, ?, 'pending', ?, ?, ?)
+                """,
+                (low_id, high_id, payload.from_id, now, now),
+            )
+            conn.commit()
+            return {"status": "pending", "from_id": payload.from_id, "to_agent_id": payload.to_agent_id}
+
+        if existing["status"] == "accepted":
+            return {"status": "already_friends"}
+
+        if existing["requested_by"] == payload.from_id:
+            return {"status": "pending"}
+
+        conn.execute(
+            """
+            UPDATE agent_friendships
+            SET requested_by = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (payload.from_id, now, existing["id"]),
+        )
+        conn.commit()
+        return {"status": "pending", "from_id": payload.from_id, "to_agent_id": payload.to_agent_id}
+    finally:
+        conn.close()
+
+
+@app.post("/api/agent/login")
+def login_agent(payload: AgentLoginRequest):
+    sign_text = f"agent_login|{payload.agent_id}"
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        require_agent_signature(
+            conn, payload.agent_id, payload.public_key, payload.signature, sign_text
+        )
+        row = conn.execute(
+            "SELECT id, name, reputation, is_frozen FROM agents WHERE id = ?",
+            (payload.agent_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+    finally:
+        conn.close()
+
+    expiry_ts = int(time.time()) + AGENT_TOKEN_TTL_SECONDS
+    token = sign_agent_token(payload.agent_id, expiry_ts)
+    return {
+        "token": token,
+        "expires_at": expiry_ts,
+        "agent": {
+            "id": row["id"],
+            "name": row["name"],
+            "reputation": row["reputation"],
+            "is_frozen": bool(row["is_frozen"] or row["reputation"] < 40),
+        },
+    }
+
+
+@app.get("/api/agent/me")
+def agent_me(request: Request):
+    agent_id = require_agent_user(request)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        agent = conn.execute(
+            "SELECT id, name, reputation, is_frozen FROM agents WHERE id = ?",
+            (agent_id,),
+        ).fetchone()
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+    finally:
+        conn.close()
+    return {
+        "agent": {
+            "id": agent["id"],
+            "name": agent["name"],
+            "reputation": agent["reputation"],
+            "is_frozen": bool(agent["is_frozen"] or agent["reputation"] < 40),
+        }
+    }
+
+
+@app.get("/api/agent/portal/friends")
+def list_agent_friends_portal(request: Request):
+    agent_id = require_agent_user(request)
+    return list_agent_friends(agent_id=agent_id)
+
+
+@app.get("/api/agent/portal/friends/requests")
+def list_agent_friend_requests_portal(request: Request):
+    agent_id = require_agent_user(request)
+    return list_agent_friend_requests(agent_id=agent_id)
+
+
+@app.post("/api/agent/portal/friends/request")
+def request_agent_friend_portal(payload: AgentPortalFriendRequest, request: Request):
+    from_id = require_agent_user(request)
+    low_id, high_id = normalize_friend_pair(from_id, payload.friend_id)
+    now = datetime.utcnow().isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        target = conn.execute(
+            "SELECT id FROM agents WHERE id = ?",
+            (payload.friend_id,),
+        ).fetchone()
+        if target is None:
+            raise HTTPException(status_code=404, detail="target agent not found")
+        existing = conn.execute(
+            """
+            SELECT id, status, requested_by
+            FROM agent_friendships
+            WHERE agent_low_id = ? AND agent_high_id = ?
+            """,
+            (low_id, high_id),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO agent_friendships
+                (agent_low_id, agent_high_id, status, requested_by, created_at, updated_at)
+                VALUES (?, ?, 'pending', ?, ?, ?)
+                """,
+                (low_id, high_id, from_id, now, now),
+            )
+            conn.commit()
+            return {"status": "pending", "from_id": from_id, "to_agent_id": payload.friend_id}
+        if existing["status"] == "accepted":
+            return {"status": "already_friends"}
+        if existing["requested_by"] == from_id:
+            return {"status": "pending"}
+        conn.execute(
+            "UPDATE agent_friendships SET requested_by = ?, updated_at = ? WHERE id = ?",
+            (from_id, now, existing["id"]),
+        )
+        conn.commit()
+        return {"status": "pending", "from_id": from_id, "to_agent_id": payload.friend_id}
+    finally:
+        conn.close()
+
+
+@app.post("/api/agent/portal/friends/respond")
+def respond_agent_friend_portal(payload: AgentPortalFriendRespond, request: Request):
+    agent_id = require_agent_user(request)
+    low_id, high_id = normalize_friend_pair(agent_id, payload.requester_id)
+    now = datetime.utcnow().isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            """
+            SELECT id, status, requested_by
+            FROM agent_friendships
+            WHERE agent_low_id = ? AND agent_high_id = ?
+            """,
+            (low_id, high_id),
+        ).fetchone()
+        if row is None or row["status"] != "pending":
+            raise HTTPException(status_code=404, detail="friend request not found")
+        if row["requested_by"] == agent_id:
+            raise HTTPException(status_code=400, detail="cannot respond own request")
+        next_status = "accepted" if payload.accept else "rejected"
+        conn.execute(
+            "UPDATE agent_friendships SET status = ?, updated_at = ? WHERE id = ?",
+            (next_status, now, row["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": next_status}
+
+
+@app.post("/api/agent/portal/friends/note")
+def upsert_agent_friend_note_portal(payload: AgentPortalFriendNote, request: Request):
+    agent_id = require_agent_user(request)
+    low_id, high_id = normalize_friend_pair(agent_id, payload.friend_id)
+    now = datetime.utcnow().isoformat()
+    note = payload.note.strip()[:300]
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT id, status FROM agent_friendships WHERE agent_low_id = ? AND agent_high_id = ?",
+            (low_id, high_id),
+        ).fetchone()
+        if row is None or row["status"] != "accepted":
+            raise HTTPException(status_code=400, detail="friendship not established")
+        if agent_id == low_id:
+            conn.execute(
+                "UPDATE agent_friendships SET note_low_to_high = ?, updated_at = ? WHERE id = ?",
+                (note, now, row["id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE agent_friendships SET note_high_to_low = ?, updated_at = ? WHERE id = ?",
+                (note, now, row["id"]),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "success", "note": note}
+
+
+@app.post("/api/agent/portal/messages/direct")
+def send_agent_direct_message_portal(payload: AgentPortalDirectMessage, request: Request):
+    from_id = require_agent_user(request)
+    low_id, high_id = normalize_friend_pair(from_id, payload.to_agent_id)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        friendship = conn.execute(
+            "SELECT status FROM agent_friendships WHERE agent_low_id = ? AND agent_high_id = ?",
+            (low_id, high_id),
+        ).fetchone()
+        if friendship is None or friendship["status"] != "accepted":
+            raise HTTPException(status_code=400, detail="agents are not friends")
+        is_malicious, matched_pattern = scan_for_malicious(payload.content)
+        if is_malicious:
+            raise HTTPException(status_code=403, detail=f"malicious content detected: {matched_pattern}")
+        score, reasons = score_text(payload.content)
+        if score < 0.4:
+            raise HTTPException(status_code=400, detail="content violates zhongdao")
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO agent_direct_messages
+            (from_id, to_agent_id, content, zhongdao_score, reasons, read_by_receiver, created_at)
+            VALUES (?, ?, ?, ?, ?, 0, ?)
+            """,
+            (from_id, payload.to_agent_id, payload.content, score, ", ".join(reasons), datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        message_id = cursor.lastrowid
+    finally:
+        conn.close()
+    return {"status": "success", "message_id": message_id}
+
+
+@app.get("/api/agent/portal/messages/direct")
+def list_agent_direct_messages_portal(friend_id: int, request: Request):
+    agent_id = require_agent_user(request)
+    return list_agent_direct_messages(agent_id=agent_id, friend_id=friend_id)
+
+
+@app.post("/api/agent/friends/respond")
+def respond_agent_friend(payload: AgentFriendRespondPayload):
+    low_id, high_id = normalize_friend_pair(payload.agent_id, payload.requester_id)
+    action_text = "accept" if payload.accept else "reject"
+    sign_text = f"friend_respond|{payload.agent_id}|{payload.requester_id}|{action_text}"
+    now = datetime.utcnow().isoformat()
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        require_agent_signature(
+            conn, payload.agent_id, payload.public_key, payload.signature, sign_text
+        )
+        row = conn.execute(
+            """
+            SELECT id, status, requested_by
+            FROM agent_friendships
+            WHERE agent_low_id = ? AND agent_high_id = ?
+            """,
+            (low_id, high_id),
+        ).fetchone()
+        if row is None or row["status"] != "pending":
+            raise HTTPException(status_code=404, detail="friend request not found")
+        if row["requested_by"] == payload.agent_id:
+            raise HTTPException(status_code=400, detail="cannot respond own request")
+
+        next_status = "accepted" if payload.accept else "rejected"
+        conn.execute(
+            "UPDATE agent_friendships SET status = ?, updated_at = ? WHERE id = ?",
+            (next_status, now, row["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": next_status}
+
+
+@app.get("/api/agent/friends")
+def list_agent_friends(agent_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT f.agent_low_id, f.agent_high_id, f.note_low_to_high, f.note_high_to_low, f.updated_at,
+                   a1.name AS low_name, a2.name AS high_name
+            FROM agent_friendships f
+            JOIN agents a1 ON a1.id = f.agent_low_id
+            JOIN agents a2 ON a2.id = f.agent_high_id
+            WHERE f.status = 'accepted' AND (f.agent_low_id = ? OR f.agent_high_id = ?)
+            ORDER BY f.updated_at DESC
+            """,
+            (agent_id, agent_id),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    friends = []
+    for row in rows:
+        if row["agent_low_id"] == agent_id:
+            friend_id = row["agent_high_id"]
+            friend_name = row["high_name"]
+            note = row["note_low_to_high"] or ""
+        else:
+            friend_id = row["agent_low_id"]
+            friend_name = row["low_name"]
+            note = row["note_high_to_low"] or ""
+        friends.append(
+            {
+                "friend_id": friend_id,
+                "friend_name": friend_name,
+                "note": note,
+                "updated_at": row["updated_at"],
+            }
+        )
+    return {"friends": friends}
+
+
+@app.get("/api/agent/friends/requests")
+def list_agent_friend_requests(agent_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT f.requested_by, f.updated_at, a.name AS requester_name
+            FROM agent_friendships f
+            JOIN agents a ON a.id = f.requested_by
+            WHERE f.status = 'pending'
+              AND ((f.agent_low_id = ? AND f.requested_by != ?) OR (f.agent_high_id = ? AND f.requested_by != ?))
+            ORDER BY f.updated_at DESC
+            """,
+            (agent_id, agent_id, agent_id, agent_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {
+        "requests": [
+            {
+                "requester_id": row["requested_by"],
+                "requester_name": row["requester_name"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.post("/api/agent/friends/note")
+def upsert_agent_friend_note(payload: AgentFriendNotePayload):
+    low_id, high_id = normalize_friend_pair(payload.agent_id, payload.friend_id)
+    sign_text = f"friend_note|{payload.agent_id}|{payload.friend_id}|{payload.note}"
+    now = datetime.utcnow().isoformat()
+    trimmed_note = payload.note.strip()[:300]
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        require_agent_signature(
+            conn, payload.agent_id, payload.public_key, payload.signature, sign_text
+        )
+        row = conn.execute(
+            """
+            SELECT id, status
+            FROM agent_friendships
+            WHERE agent_low_id = ? AND agent_high_id = ?
+            """,
+            (low_id, high_id),
+        ).fetchone()
+        if row is None or row["status"] != "accepted":
+            raise HTTPException(status_code=400, detail="friendship not established")
+
+        if payload.agent_id == low_id:
+            conn.execute(
+                "UPDATE agent_friendships SET note_low_to_high = ?, updated_at = ? WHERE id = ?",
+                (trimmed_note, now, row["id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE agent_friendships SET note_high_to_low = ?, updated_at = ? WHERE id = ?",
+                (trimmed_note, now, row["id"]),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "success", "note": trimmed_note}
+
+
+@app.post("/api/agent/messages/direct")
+def send_agent_direct_message(payload: AgentDirectMessagePayload):
+    sign_text = f"direct_message|{payload.from_id}|{payload.to_agent_id}|{payload.content}"
+    now = datetime.utcnow().isoformat()
+    low_id, high_id = normalize_friend_pair(payload.from_id, payload.to_agent_id)
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        require_agent_signature(
+            conn, payload.from_id, payload.public_key, payload.signature, sign_text
+        )
+        friendship = conn.execute(
+            """
+            SELECT id, status
+            FROM agent_friendships
+            WHERE agent_low_id = ? AND agent_high_id = ?
+            """,
+            (low_id, high_id),
+        ).fetchone()
+        if friendship is None or friendship["status"] != "accepted":
+            raise HTTPException(status_code=400, detail="agents are not friends")
+
+        is_malicious, matched_pattern = scan_for_malicious(payload.content)
+        if is_malicious:
+            raise HTTPException(status_code=403, detail=f"malicious content detected: {matched_pattern}")
+
+        score, reasons = score_text(payload.content)
+        if score < 0.4:
+            raise HTTPException(status_code=400, detail="content violates zhongdao")
+
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO agent_direct_messages
+            (from_id, to_agent_id, content, zhongdao_score, reasons, read_by_receiver, created_at)
+            VALUES (?, ?, ?, ?, ?, 0, ?)
+            """,
+            (payload.from_id, payload.to_agent_id, payload.content, score, ", ".join(reasons), now),
+        )
+        conn.commit()
+        message_id = cursor.lastrowid
+    finally:
+        conn.close()
+    return {"status": "success", "message_id": message_id}
+
+
+@app.get("/api/agent/messages/direct")
+def list_agent_direct_messages(agent_id: int, friend_id: int):
+    low_id, high_id = normalize_friend_pair(agent_id, friend_id)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        friendship = conn.execute(
+            """
+            SELECT id, status
+            FROM agent_friendships
+            WHERE agent_low_id = ? AND agent_high_id = ?
+            """,
+            (low_id, high_id),
+        ).fetchone()
+        if friendship is None or friendship["status"] != "accepted":
+            raise HTTPException(status_code=400, detail="agents are not friends")
+
+        rows = conn.execute(
+            """
+            SELECT m.id, m.from_id, m.to_agent_id, m.content, m.zhongdao_score, m.reasons, m.created_at,
+                   a1.name AS from_name, a2.name AS to_name
+            FROM agent_direct_messages m
+            JOIN agents a1 ON a1.id = m.from_id
+            JOIN agents a2 ON a2.id = m.to_agent_id
+            WHERE (m.from_id = ? AND m.to_agent_id = ?) OR (m.from_id = ? AND m.to_agent_id = ?)
+            ORDER BY m.created_at DESC
+            LIMIT 100
+            """,
+            (agent_id, friend_id, friend_id, agent_id),
+        ).fetchall()
+        conn.execute(
+            "UPDATE agent_direct_messages SET read_by_receiver = 1 WHERE to_agent_id = ? AND from_id = ?",
+            (agent_id, friend_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "messages": [
+            {
+                "id": row["id"],
+                "from_id": row["from_id"],
+                "from_name": row["from_name"],
+                "to_agent_id": row["to_agent_id"],
+                "to_name": row["to_name"],
+                "content": row["content"],
+                "zhongdao_score": row["zhongdao_score"],
+                "reasons": row["reasons"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
     }
 
 

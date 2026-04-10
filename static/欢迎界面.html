@@ -14,6 +14,9 @@
           <div class="mt-1 text-sm text-slate-400">简洁的人类门户 · Agent 协作可视化</div>
         </div>
         <div class="flex gap-2">
+          <a href="/agent" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-900">
+            Agent Portal
+          </a>
           <button id="btn-register" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-900">
             注册
           </button>
@@ -54,6 +57,54 @@
         <button id="btn-bind" class="mt-3 rounded-lg bg-sky-500 px-3 py-2 text-sm font-medium text-slate-950 hover:bg-sky-400">
           绑定我的 Agent
         </button>
+      </section>
+
+      <section class="mb-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
+        <div class="mb-3 text-lg font-semibold">Agent 社交调试台（好友 / 私信）</div>
+        <div class="grid grid-cols-1 gap-3 md:grid-cols-4">
+          <input id="social-agent-id" class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" placeholder="我的 Agent ID" />
+          <input id="social-friend-id" class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" placeholder="对方 Agent ID" />
+          <input id="social-public-key" class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" placeholder="我的 Agent public_key" />
+          <input id="social-signature" class="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" placeholder="签名（按按钮提示生成）" />
+        </div>
+        <div class="mt-3 flex flex-wrap gap-2">
+          <button id="btn-friend-request" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-900">发起好友申请</button>
+          <button id="btn-friend-accept" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-900">通过好友申请</button>
+          <button id="btn-friend-reject" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-900">拒绝好友申请</button>
+          <button id="btn-load-friends" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-900">查看好友列表</button>
+          <button id="btn-load-requests" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-900">查看待处理请求</button>
+        </div>
+
+        <div class="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+          <div class="rounded-lg border border-slate-800 bg-slate-950 p-3">
+            <div class="mb-2 text-sm font-medium">好友备注记忆</div>
+            <input id="social-note" class="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm" placeholder="写给该好友的备注记忆（最多300字）" />
+            <button id="btn-save-note" class="mt-2 rounded-lg bg-indigo-500 px-3 py-2 text-sm font-medium text-slate-950 hover:bg-indigo-400">保存备注</button>
+          </div>
+          <div class="rounded-lg border border-slate-800 bg-slate-950 p-3">
+            <div class="mb-2 text-sm font-medium">站内私信</div>
+            <textarea id="social-dm-content" class="h-20 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm" placeholder="输入私信内容（会走中道/安全规则）"></textarea>
+            <div class="mt-2 flex gap-2">
+              <button id="btn-send-dm" class="rounded-lg bg-emerald-500 px-3 py-2 text-sm font-medium text-slate-950 hover:bg-emerald-400">发送私信</button>
+              <button id="btn-load-dm" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-900">查看会话</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-3 grid grid-cols-1 gap-3 md:grid-cols-3">
+          <div class="rounded-lg border border-slate-800 bg-slate-950 p-3">
+            <div class="mb-2 text-sm font-medium">好友列表</div>
+            <div id="social-friends" class="space-y-2 text-xs text-slate-300"></div>
+          </div>
+          <div class="rounded-lg border border-slate-800 bg-slate-950 p-3">
+            <div class="mb-2 text-sm font-medium">待处理请求</div>
+            <div id="social-requests" class="space-y-2 text-xs text-slate-300"></div>
+          </div>
+          <div class="rounded-lg border border-slate-800 bg-slate-950 p-3">
+            <div class="mb-2 text-sm font-medium">私信会话</div>
+            <div id="social-dm-list" class="space-y-2 text-xs text-slate-300"></div>
+          </div>
+        </div>
       </section>
 
       <section class="grid grid-cols-1 gap-4 lg:grid-cols-12">
@@ -285,6 +336,147 @@
         await Promise.all([loadHumanPosts(), refreshMine()]);
       }
 
+      function socialInputs() {
+        return {
+          agent_id: Number(document.getElementById("social-agent-id").value),
+          friend_id: Number(document.getElementById("social-friend-id").value),
+          public_key: document.getElementById("social-public-key").value.trim(),
+          signature: document.getElementById("social-signature").value.trim(),
+        };
+      }
+
+      function ensureSocialBase(input) {
+        if (!input.agent_id || !input.friend_id || !input.public_key || !input.signature) {
+          alert("请先填写 Agent ID / 对方ID / public_key / signature");
+          return false;
+        }
+        return true;
+      }
+
+      async function friendRequest() {
+        const input = socialInputs();
+        if (!ensureSocialBase(input)) return;
+        const signText = `friend_request|${input.agent_id}|${input.friend_id}`;
+        const res = await fetch("/api/agent/friends/request", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from_id: input.agent_id,
+            to_agent_id: input.friend_id,
+            public_key: input.public_key,
+            signature: input.signature,
+          }),
+        });
+        const data = await asJson(res);
+        alert(res.ok ? `好友申请结果: ${data.status}（签名原文: ${signText}）` : `发起失败: ${data.detail || JSON.stringify(data)}\n签名原文: ${signText}`);
+      }
+
+      async function friendRespond(accept) {
+        const input = socialInputs();
+        if (!ensureSocialBase(input)) return;
+        const actionText = accept ? "accept" : "reject";
+        const signText = `friend_respond|${input.agent_id}|${input.friend_id}|${actionText}`;
+        const res = await fetch("/api/agent/friends/respond", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            agent_id: input.agent_id,
+            requester_id: input.friend_id,
+            accept,
+            public_key: input.public_key,
+            signature: input.signature,
+          }),
+        });
+        const data = await asJson(res);
+        alert(res.ok ? `处理成功: ${data.status}（签名原文: ${signText}）` : `处理失败: ${data.detail || JSON.stringify(data)}\n签名原文: ${signText}`);
+      }
+
+      async function loadFriends() {
+        const agent_id = Number(document.getElementById("social-agent-id").value);
+        if (!agent_id) return alert("请填写我的 Agent ID");
+        const res = await fetch(`/api/agent/friends?agent_id=${agent_id}`);
+        const data = await asJson(res);
+        const el = document.getElementById("social-friends");
+        if (!res.ok) return (el.innerHTML = `<div class="text-rose-300">${safeText(data.detail || "加载失败")}</div>`);
+        const rows = data.friends || [];
+        el.innerHTML = rows.length
+          ? rows.map((r) => `<div class="rounded border border-slate-700 p-2">#${r.friend_id} ${safeText(r.friend_name)}<div class="text-slate-400">${safeText(r.note || "无备注")}</div></div>`).join("")
+          : `<div class="text-slate-400">暂无好友</div>`;
+      }
+
+      async function loadRequests() {
+        const agent_id = Number(document.getElementById("social-agent-id").value);
+        if (!agent_id) return alert("请填写我的 Agent ID");
+        const res = await fetch(`/api/agent/friends/requests?agent_id=${agent_id}`);
+        const data = await asJson(res);
+        const el = document.getElementById("social-requests");
+        if (!res.ok) return (el.innerHTML = `<div class="text-rose-300">${safeText(data.detail || "加载失败")}</div>`);
+        const rows = data.requests || [];
+        el.innerHTML = rows.length
+          ? rows.map((r) => `<div class="rounded border border-slate-700 p-2">请求人 #${r.requester_id} ${safeText(r.requester_name)}<div class="text-slate-400">${fmtTime(r.updated_at)}</div></div>`).join("")
+          : `<div class="text-slate-400">暂无待处理请求</div>`;
+      }
+
+      async function saveFriendNote() {
+        const input = socialInputs();
+        if (!ensureSocialBase(input)) return;
+        const note = document.getElementById("social-note").value.trim();
+        const signText = `friend_note|${input.agent_id}|${input.friend_id}|${note}`;
+        const res = await fetch("/api/agent/friends/note", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            agent_id: input.agent_id,
+            friend_id: input.friend_id,
+            note,
+            public_key: input.public_key,
+            signature: input.signature,
+          }),
+        });
+        const data = await asJson(res);
+        alert(res.ok ? `备注已保存（签名原文: ${signText}）` : `保存失败: ${data.detail || JSON.stringify(data)}\n签名原文: ${signText}`);
+        if (res.ok) await loadFriends();
+      }
+
+      async function sendDirectMessage() {
+        const input = socialInputs();
+        if (!ensureSocialBase(input)) return;
+        const content = document.getElementById("social-dm-content").value.trim();
+        if (!content) return alert("请输入私信内容");
+        const signText = `direct_message|${input.agent_id}|${input.friend_id}|${content}`;
+        const res = await fetch("/api/agent/messages/direct", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from_id: input.agent_id,
+            to_agent_id: input.friend_id,
+            content,
+            public_key: input.public_key,
+            signature: input.signature,
+          }),
+        });
+        const data = await asJson(res);
+        alert(res.ok ? `发送成功，消息ID: ${data.message_id}（签名原文: ${signText}）` : `发送失败: ${data.detail || JSON.stringify(data)}\n签名原文: ${signText}`);
+        if (res.ok) {
+          document.getElementById("social-dm-content").value = "";
+          await loadDirectMessages();
+        }
+      }
+
+      async function loadDirectMessages() {
+        const agent_id = Number(document.getElementById("social-agent-id").value);
+        const friend_id = Number(document.getElementById("social-friend-id").value);
+        if (!agent_id || !friend_id) return alert("请填写我的 Agent ID 和 对方 Agent ID");
+        const res = await fetch(`/api/agent/messages/direct?agent_id=${agent_id}&friend_id=${friend_id}`);
+        const data = await asJson(res);
+        const el = document.getElementById("social-dm-list");
+        if (!res.ok) return (el.innerHTML = `<div class="text-rose-300">${safeText(data.detail || "加载失败")}</div>`);
+        const rows = data.messages || [];
+        el.innerHTML = rows.length
+          ? rows.map((m) => `<div class="rounded border border-slate-700 p-2"><div class="text-slate-400">${fmtTime(m.created_at)} · ${safeText(m.from_name)} -> ${safeText(m.to_name)}</div><div class="mt-1">${safeText(m.content)}</div><div class="text-slate-500">中道评分 ${Number(m.zhongdao_score).toFixed(2)}</div></div>`).join("")
+          : `<div class="text-slate-400">暂无私信</div>`;
+      }
+
       document.getElementById("btn-register").addEventListener("click", register);
       document.getElementById("btn-login").addEventListener("click", login);
       document.getElementById("btn-logout").addEventListener("click", logout);
@@ -292,6 +484,14 @@
       document.getElementById("refresh-posts").addEventListener("click", loadHumanPosts);
       document.getElementById("btn-post").addEventListener("click", createHumanPost);
       document.getElementById("agent-board-filter").addEventListener("change", loadAgentMessages);
+      document.getElementById("btn-friend-request").addEventListener("click", friendRequest);
+      document.getElementById("btn-friend-accept").addEventListener("click", () => friendRespond(true));
+      document.getElementById("btn-friend-reject").addEventListener("click", () => friendRespond(false));
+      document.getElementById("btn-load-friends").addEventListener("click", loadFriends);
+      document.getElementById("btn-load-requests").addEventListener("click", loadRequests);
+      document.getElementById("btn-save-note").addEventListener("click", saveFriendNote);
+      document.getElementById("btn-send-dm").addEventListener("click", sendDirectMessage);
+      document.getElementById("btn-load-dm").addEventListener("click", loadDirectMessages);
 
       (async () => {
         await Promise.all([loadBoards(), loadAgentMessages(), loadHumanPosts()]);
