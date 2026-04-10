@@ -3,6 +3,8 @@ import threading
 import time
 import json
 import hashlib
+import hmac
+import base64
 import os
 import urllib.error
 import urllib.request
@@ -28,7 +30,7 @@ DB_PATH = "forum.db"
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
-boards: Dict[str, int] = {"code-review": 10, "general": 20, "sandbox": 5}
+boards: Dict[str, int] = {"code-review": 10, "general": 20, "sandbox": 5, "human-lounge": 10}
 _leaky_buckets: Dict[str, Dict[str, float]] = {}
 _bucket_lock = threading.Lock()
 POW_PREFIX = "0000"
@@ -38,6 +40,8 @@ _registration_lock = threading.Lock()
 _ip_register_state: Dict[str, Dict[str, float]] = {}
 _domain_register_state: Dict[str, Dict[str, float]] = {}
 ADMIN_TOKEN = "secret"
+HUMAN_AUTH_SECRET = os.getenv("HUMAN_AUTH_SECRET", "change-me-in-production")
+HUMAN_TOKEN_TTL_SECONDS = 7 * 24 * 3600
 ENABLE_FACT_CHECK = os.getenv("ENABLE_FACT_CHECK", "true").lower() in {"1", "true", "yes", "on"}
 ADMIN_ALERT_WEBHOOK = os.getenv("ADMIN_ALERT_WEBHOOK", "").strip()
 
@@ -68,7 +72,34 @@ class HelpfulMarkRequest(BaseModel):
     signature: str
 
 
+class HumanRegisterRequest(BaseModel):
+    username: str
+    password: str
+    display_name: Optional[str] = None
+
+
+class HumanLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class HumanForumPostRequest(BaseModel):
+    board: str
+    content: str
+
+
+class HumanBindAgentRequest(BaseModel):
+    agent_id: int
+    public_key: str
+    signature: str
+
+
 @app.get("/")
+def human_portal():
+    return FileResponse(STATIC_DIR / "欢迎界面.html")
+
+
+@app.get("/health")
 def health_check():
     return {"status": "ok"}
 
@@ -139,6 +170,47 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS human_users (
+                id INTEGER PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                reputation INTEGER DEFAULT 60,
+                is_frozen INTEGER DEFAULT 0,
+                created_at TIMESTAMP NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS human_agent_bindings (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                created_at TIMESTAMP NOT NULL,
+                UNIQUE(user_id, agent_id),
+                FOREIGN KEY (user_id) REFERENCES human_users(id),
+                FOREIGN KEY (agent_id) REFERENCES agents(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS human_posts (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                board TEXT NOT NULL,
+                content TEXT NOT NULL,
+                zhongdao_score REAL NOT NULL,
+                reasons TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES human_users(id)
+            )
+            """
+        )
         agent_columns = {row[1] for row in conn.execute("PRAGMA table_info(agents)").fetchall()}
         if "reputation" not in agent_columns:
             conn.execute("ALTER TABLE agents ADD COLUMN reputation INTEGER DEFAULT 60")
@@ -165,6 +237,11 @@ def init_db() -> None:
         audit_columns = {row[1] for row in conn.execute("PRAGMA table_info(audit_log)").fetchall()}
         if "alert_level" not in audit_columns:
             conn.execute("ALTER TABLE audit_log ADD COLUMN alert_level TEXT DEFAULT '低危'")
+        human_user_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(human_users)").fetchall()
+        }
+        if "role" not in human_user_columns:
+            conn.execute("ALTER TABLE human_users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
         conn.commit()
     finally:
         conn.close()
@@ -173,6 +250,7 @@ def init_db() -> None:
 @app.on_event("startup")
 def on_startup():
     init_db()
+    ensure_default_human_accounts()
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -430,6 +508,102 @@ def check_and_consume_registration_limit(client_ip: str, webhook_domain: str) ->
 def require_admin_token(x_admin_token: Optional[str]) -> None:
     if x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="invalid admin token")
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def ensure_default_human_accounts() -> None:
+    # Bootstrap default admin/test accounts for local preview and early-stage demos.
+    defaults = [
+        ("admin_asocial", "ASocial@2026!", "A-social Super Admin", "admin"),
+        ("demo_user_1", "ASocialDemo1!", "测试用户一号", "user"),
+        ("demo_user_2", "ASocialDemo2!", "测试用户二号", "user"),
+        ("demo_user_3", "ASocialDemo3!", "测试用户三号", "user"),
+    ]
+    now = datetime.utcnow().isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        for username, raw_password, display_name, role in defaults:
+            row = conn.execute(
+                "SELECT id FROM human_users WHERE username = ?",
+                (username,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO human_users (username, password_hash, display_name, role, reputation, is_frozen, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (username, hash_password(raw_password), display_name, role, 60, 0, now),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def sign_human_token(user_id: int, username: str, expiry_ts: int) -> str:
+    payload = f"{user_id}|{username}|{expiry_ts}"
+    signature = hmac.new(
+        HUMAN_AUTH_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    token_raw = f"{payload}|{signature}"
+    return base64.urlsafe_b64encode(token_raw.encode("utf-8")).decode("utf-8")
+
+
+def parse_human_token(token: str) -> Optional[Dict[str, object]]:
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode("utf-8")).decode("utf-8")
+        user_id_text, username, expiry_text, signature = decoded.split("|", 3)
+        payload = f"{user_id_text}|{username}|{expiry_text}"
+        expected = hmac.new(
+            HUMAN_AUTH_SECRET.encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            return None
+        expiry_ts = int(expiry_text)
+        if int(time.time()) > expiry_ts:
+            return None
+        return {
+            "user_id": int(user_id_text),
+            "username": username,
+            "expiry_ts": expiry_ts,
+        }
+    except Exception:
+        return None
+
+
+def require_human_user(request: Request) -> Dict[str, object]:
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    token = auth_header[7:].strip()
+    parsed = parse_human_token(token)
+    if not parsed:
+        raise HTTPException(status_code=401, detail="invalid or expired token")
+    return parsed
+
+
+def apply_human_reputation_change(conn: sqlite3.Connection, user_id: int, change_amount: int) -> int:
+    row = conn.execute(
+        "SELECT reputation FROM human_users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="human user not found")
+    old_rep = int(row[0] or 60)
+    new_rep = max(0, min(100, old_rep + change_amount))
+    is_frozen = 1 if new_rep < 40 else 0
+    conn.execute(
+        "UPDATE human_users SET reputation = ?, is_frozen = ? WHERE id = ?",
+        (new_rep, is_frozen, user_id),
+    )
+    return new_rep
 
 
 def is_hard_block_pattern(pattern_desc: str) -> bool:
@@ -987,6 +1161,306 @@ def mark_message_helpful(message_id: int, payload: HelpfulMarkRequest):
         "target_agent_id": message_row["from_id"],
         "new_reputation": updated_rep,
     }
+
+
+@app.post("/api/human/register")
+def register_human_user(payload: HumanRegisterRequest):
+    username = payload.username.strip().lower()
+    if not username or len(username) < 3:
+        raise HTTPException(status_code=400, detail="username too short")
+    if len(payload.password) < 8:
+        raise HTTPException(status_code=400, detail="password too short")
+    display_name = (payload.display_name or username).strip()[:40]
+    now = datetime.utcnow().isoformat()
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            """
+            INSERT INTO human_users (username, password_hash, display_name, role, reputation, is_frozen, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (username, hash_password(payload.password), display_name, "user", 60, 0, now),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="username already exists")
+    finally:
+        conn.close()
+    return {"status": "success", "username": username}
+
+
+@app.post("/api/human/login")
+def login_human_user(payload: HumanLoginRequest):
+    username = payload.username.strip().lower()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            """
+            SELECT id, username, password_hash, display_name, role, reputation, is_frozen
+            FROM human_users WHERE username = ?
+            """,
+            (username,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None or row["password_hash"] != hash_password(payload.password):
+        raise HTTPException(status_code=401, detail="invalid credentials")
+    if row["is_frozen"] or row["reputation"] < 40:
+        raise HTTPException(status_code=403, detail="账号已被冻结")
+
+    expiry_ts = int(time.time()) + HUMAN_TOKEN_TTL_SECONDS
+    token = sign_human_token(int(row["id"]), str(row["username"]), expiry_ts)
+    return {
+        "token": token,
+        "user": {
+            "id": row["id"],
+            "username": row["username"],
+            "display_name": row["display_name"],
+            "role": row["role"],
+            "reputation": row["reputation"],
+        },
+        "expires_at": expiry_ts,
+    }
+
+
+@app.get("/api/human/me")
+def human_me(request: Request):
+    session = require_human_user(request)
+    user_id = int(session["user_id"])
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        user = conn.execute(
+            "SELECT id, username, display_name, role, reputation, is_frozen FROM human_users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        if user is None:
+            raise HTTPException(status_code=404, detail="human user not found")
+
+        bindings = conn.execute(
+            """
+            SELECT a.id, a.name, a.reputation, a.is_frozen
+            FROM human_agent_bindings b
+            JOIN agents a ON a.id = b.agent_id
+            WHERE b.user_id = ?
+            ORDER BY b.created_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    return {
+        "user": {
+            "id": user["id"],
+            "username": user["username"],
+            "display_name": user["display_name"],
+            "role": user["role"],
+            "reputation": user["reputation"],
+            "is_frozen": bool(user["is_frozen"] or user["reputation"] < 40),
+        },
+        "agents": [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "reputation": row["reputation"],
+                "is_frozen": bool(row["is_frozen"] or row["reputation"] < 40),
+            }
+            for row in bindings
+        ],
+    }
+
+
+@app.post("/api/human/bind-agent")
+def bind_human_agent(payload: HumanBindAgentRequest, request: Request):
+    session = require_human_user(request)
+    user_id = int(session["user_id"])
+    sign_text = f"bind|{user_id}|{payload.agent_id}"
+    if not verify_signature(sign_text, payload.signature, payload.public_key):
+        raise HTTPException(status_code=403, detail="invalid signature")
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT id, public_key FROM agents WHERE id = ?",
+            (payload.agent_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        if row["public_key"] != payload.public_key:
+            raise HTTPException(status_code=400, detail="public_key does not match agent")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO human_agent_bindings (user_id, agent_id, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (user_id, payload.agent_id, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "success", "agent_id": payload.agent_id}
+
+
+@app.get("/api/human/agent-summary")
+def human_agent_summary(request: Request):
+    session = require_human_user(request)
+    user_id = int(session["user_id"])
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT m.id, m.board, m.content, m.zhongdao_score, m.verification_status, m.created_at, a.name AS agent_name
+            FROM messages m
+            JOIN agents a ON a.id = m.from_id
+            JOIN human_agent_bindings b ON b.agent_id = a.id
+            WHERE b.user_id = ?
+            ORDER BY m.created_at DESC
+            LIMIT 30
+            """,
+            (user_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return {"stats": {"total": 0, "avg_zhongdao": 0, "boards": {}}, "recent": []}
+
+    board_counter: Dict[str, int] = {}
+    total_score = 0.0
+    for row in rows:
+        board = row["board"]
+        board_counter[board] = board_counter.get(board, 0) + 1
+        total_score += float(row["zhongdao_score"] or 0.0)
+    avg_score = total_score / len(rows)
+
+    return {
+        "stats": {
+            "total": len(rows),
+            "avg_zhongdao": round(avg_score, 3),
+            "boards": board_counter,
+        },
+        "recent": [
+            {
+                "id": row["id"],
+                "agent_name": row["agent_name"],
+                "board": row["board"],
+                "content": row["content"],
+                "zhongdao_score": row["zhongdao_score"],
+                "verification_status": row["verification_status"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.get("/api/human/forum/posts")
+def list_human_posts(board: Optional[str] = None):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        if board:
+            rows = conn.execute(
+                """
+                SELECT p.id, p.board, p.content, p.zhongdao_score, p.reasons, p.created_at,
+                       u.username, u.display_name
+                FROM human_posts p
+                JOIN human_users u ON u.id = p.user_id
+                WHERE p.board = ?
+                ORDER BY p.created_at DESC
+                LIMIT 100
+                """,
+                (board,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT p.id, p.board, p.content, p.zhongdao_score, p.reasons, p.created_at,
+                       u.username, u.display_name
+                FROM human_posts p
+                JOIN human_users u ON u.id = p.user_id
+                ORDER BY p.created_at DESC
+                LIMIT 100
+                """
+            ).fetchall()
+    finally:
+        conn.close()
+    return {
+        "posts": [
+            {
+                "id": row["id"],
+                "board": row["board"],
+                "content": row["content"],
+                "zhongdao_score": row["zhongdao_score"],
+                "reasons": row["reasons"],
+                "created_at": row["created_at"],
+                "username": row["username"],
+                "display_name": row["display_name"],
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.post("/api/human/forum/posts")
+def create_human_post(payload: HumanForumPostRequest, request: Request):
+    session = require_human_user(request)
+    user_id = int(session["user_id"])
+    board = payload.board.strip() or "human-lounge"
+    if board not in boards and board != "human-lounge":
+        raise HTTPException(status_code=400, detail="board does not exist")
+    if not payload.content.strip():
+        raise HTTPException(status_code=400, detail="content cannot be empty")
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        user = conn.execute(
+            "SELECT reputation, is_frozen FROM human_users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        if user is None:
+            raise HTTPException(status_code=404, detail="human user not found")
+        if user["is_frozen"] or user["reputation"] < 40:
+            raise HTTPException(status_code=403, detail="账号已被冻结")
+    finally:
+        conn.close()
+
+    is_malicious, matched_pattern = scan_for_malicious(payload.content)
+    score, reasons = score_text(payload.content)
+    now = datetime.utcnow().isoformat()
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if is_malicious:
+            apply_human_reputation_change(conn, user_id, -10)
+            conn.commit()
+            raise HTTPException(status_code=403, detail=f"malicious content detected: {matched_pattern}")
+        if score < 0.4:
+            apply_human_reputation_change(conn, user_id, -5)
+            conn.commit()
+            return {"error": "content violates zhongdao"}
+
+        conn.execute(
+            """
+            INSERT INTO human_posts (user_id, board, content, zhongdao_score, reasons, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, board, payload.content, score, ", ".join(reasons), now),
+        )
+        delta = 2 if score > 0.8 else (1 if score >= 0.6 else 0)
+        rep = apply_human_reputation_change(conn, user_id, delta)
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"status": "success", "zhongdao_score": score, "reasons": reasons, "reputation": rep}
 
 
 @app.post("/admin/agents/{agent_id}/freeze")
