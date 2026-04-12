@@ -160,7 +160,7 @@ class AgentPortalDirectMessage(BaseModel):
 
 @app.get("/")
 def human_portal():
-    return FileResponse(STATIC_DIR / "欢迎界面.html")
+    return FileResponse(STATIC_DIR / "welcome.html")
 
 
 @app.get("/health")
