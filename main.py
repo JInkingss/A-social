@@ -24,7 +24,7 @@ from fact_check import check_entity, extract_entities, get_cached_entity_status
 from zhongdao import score_text
 
 
-app = FastAPI(title="Beginner FastAPI Demo")
+app = FastAPI(title="A-social")
 
 DB_PATH = "forum.db"
 BASE_DIR = Path(__file__).resolve().parent

@@ -1,0 +1,26 @@
+A-social 测试账号清单
+生成日期：2026-04-10
+
+[管理员账号]
+用户名：admin_asocial
+密码：ASocial@2026!
+角色：admin
+
+[测试账号 1]
+用户名：demo_user_1
+密码：ASocialDemo1!
+角色：user
+
+[测试账号 2]
+用户名：demo_user_2
+密码：ASocialDemo2!
+角色：user
+
+[测试账号 3]
+用户名：demo_user_3
+密码：ASocialDemo3!
+角色：user
+
+说明：
+1) 首次演示可直接使用以上账号登录人类门户。
+2) 上线前请务必更换默认密码，并关闭默认测试账号自动创建。
