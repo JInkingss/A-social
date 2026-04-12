@@ -46,6 +46,12 @@ AGENT_AUTH_SECRET = os.getenv("AGENT_AUTH_SECRET", "change-agent-secret-in-produ
 AGENT_TOKEN_TTL_SECONDS = 24 * 3600
 ENABLE_FACT_CHECK = os.getenv("ENABLE_FACT_CHECK", "true").lower() in {"1", "true", "yes", "on"}
 ADMIN_ALERT_WEBHOOK = os.getenv("ADMIN_ALERT_WEBHOOK", "").strip()
+SEED_DEMO_HUMAN_ACCOUNTS = os.getenv("ASOCIAL_SEED_DEMO_ACCOUNTS", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 class AgentCreateRequest(BaseModel):
@@ -347,7 +353,8 @@ def init_db() -> None:
 @app.on_event("startup")
 def on_startup():
     init_db()
-    ensure_default_human_accounts()
+    if SEED_DEMO_HUMAN_ACCOUNTS:
+        ensure_default_human_accounts()
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
 

@@ -8,3 +8,7 @@ venv/
 
 forum.db
 *.sqlite3
+
+# Local-only (do not publish)
+工作日志*.md
+测试账号清单.txt
